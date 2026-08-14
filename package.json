@@ -1,0 +1,16 @@
+{
+  "name": "riyad-video-api",
+  "version": "1.0.0",
+  "description": "Self-hosted YouTube search + download API (drop-in replacement for third-party APIs used by vidio.js)",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "yt-search": "^2.13.1"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
