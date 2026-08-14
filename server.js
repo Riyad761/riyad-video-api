@@ -94,7 +94,12 @@ function runYtDlp(url, formatArg) {
       "-g", "--no-playlist",
       "--print", "%(title)s",
       "--js-runtimes", "deno",
-      "--extractor-args", "youtube:player_client=android"
+      // FIX: the "android" player client does NOT support cookies at all —
+      // yt-dlp prints "Skipping client android since it does not support
+      // cookies" and silently falls back to a client that then gets
+      // bot-detected ("This video is unavailable"). "web" supports cookies
+      // properly, which is the whole point of having YOUTUBE_COOKIES set.
+      "--extractor-args", "youtube:player_client=web"
     ];
     if (hasCookies) args.push("--cookies", COOKIES_PATH);
     args.push(url);
