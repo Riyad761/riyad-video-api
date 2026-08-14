@@ -24,9 +24,32 @@ const express = require("express");
 const yts = require("yt-search");
 const { execFile } = require("child_process");
 const os = require("os");
+const fs = require("fs");
+const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// ─────────────────────────────────────────────
+//  Optional YouTube cookies (env var YOUTUBE_COOKIES, Netscape cookies.txt
+//  format). YouTube heavily rate-limits/blocks cloud-provider IPs (429
+//  errors) regardless of client emulation — the practical fix is sending
+//  requests as a logged-in browser session via cookies. Written to disk
+//  once at startup so yt-dlp can reference it with --cookies.
+// ─────────────────────────────────────────────
+const COOKIES_PATH = path.join(__dirname, "cookies.txt");
+let hasCookies = false;
+if (process.env.YOUTUBE_COOKIES && process.env.YOUTUBE_COOKIES.trim()) {
+  try {
+    fs.writeFileSync(COOKIES_PATH, process.env.YOUTUBE_COOKIES.trim() + "\n");
+    hasCookies = true;
+    console.log("✅ YouTube cookies loaded from YOUTUBE_COOKIES env var.");
+  } catch (e) {
+    console.error("⚠️ Failed to write cookies file:", e.message);
+  }
+} else {
+  console.warn("⚠️ No YOUTUBE_COOKIES env var set — requests may hit 429 rate limits on cloud IPs.");
+}
 
 // ─────────────────────────────────────────────
 //  GET /api/video/search?songName=...
@@ -66,16 +89,19 @@ app.get("/api/video/search", async (req, res) => {
 // ─────────────────────────────────────────────
 function runYtDlp(url, formatArg) {
   return new Promise((resolve, reject) => {
+    const args = [
+      "-f", formatArg,
+      "-g", "--no-playlist",
+      "--print", "%(title)s",
+      "--js-runtimes", "deno",
+      "--extractor-args", "youtube:player_client=android"
+    ];
+    if (hasCookies) args.push("--cookies", COOKIES_PATH);
+    args.push(url);
+
     execFile(
       "yt-dlp",
-      [
-        "-f", formatArg,
-        "-g", "--no-playlist",
-        "--print", "%(title)s",
-        "--js-runtimes", "deno",
-        "--extractor-args", "youtube:player_client=android",
-        url
-      ],
+      args,
       { timeout: 30000, maxBuffer: 1024 * 1024 * 5 },
       (err, stdout, stderr) => {
         if (err) return reject(new Error(stderr || err.message));
@@ -140,7 +166,11 @@ app.get("/api/video/download", async (req, res) => {
 });
 
 app.get("/", (req, res) => {
-  res.json({ status: "ok", endpoints: ["/api/video/search?songName=", "/api/video/download?link=&format="] });
+  res.json({
+    status: "ok",
+    cookiesLoaded: hasCookies,
+    endpoints: ["/api/video/search?songName=", "/api/video/download?link=&format="]
+  });
 });
 
 app.listen(PORT, () => {
