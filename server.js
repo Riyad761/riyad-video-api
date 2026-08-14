@@ -81,6 +81,44 @@ app.get("/api/video/search", async (req, res) => {
 });
 
 // ─────────────────────────────────────────────
+//  GET /api/video/lyrics?songName=...
+//  Same shape as /api/video/search, but searches "<songName> lyrics" and
+//  prioritizes results whose title actually contains "lyric(s)" — so you
+//  get lyric-video versions of the song instead of the regular MV/audio.
+// ─────────────────────────────────────────────
+app.get("/api/video/lyrics", async (req, res) => {
+  const songName = req.query.songName;
+  if (!songName) {
+    return res.status(400).json({ error: "songName query param is required" });
+  }
+
+  try {
+    const result = await yts(`${songName} lyrics`);
+    const all = result.videos || [];
+
+    // Prefer results whose title actually says "lyric(s)" — a plain
+    // "<song> lyrics" search still returns some non-lyric-video results
+    // mixed in (official MV, audio-only upload, etc).
+    const lyricsOnly = all.filter(v => /lyrics?/i.test(v.title));
+    const videos = (lyricsOnly.length ? lyricsOnly : all).slice(0, 10).map(v => ({
+      id: v.videoId,
+      title: v.title,
+      duration: v.timestamp,
+      thumbnail: v.thumbnail,
+      url: v.url
+    }));
+
+    if (videos.length === 0) {
+      return res.status(404).json([]);
+    }
+    return res.json(videos);
+  } catch (err) {
+    console.error("[lyrics] error:", err.message);
+    return res.status(500).json({ error: err.message });
+  }
+});
+
+// ─────────────────────────────────────────────
 //  GET /api/video/download?link=<videoID or URL>&format=mp4
 //
 //  Resolves a direct, temporary googlevideo.com URL via yt-dlp
@@ -174,7 +212,7 @@ app.get("/", (req, res) => {
   res.json({
     status: "ok",
     cookiesLoaded: hasCookies,
-    endpoints: ["/api/video/search?songName=", "/api/video/download?link=&format="]
+    endpoints: ["/api/video/search?songName=", "/api/video/lyrics?songName=", "/api/video/download?link=&format="]
   });
 });
 
