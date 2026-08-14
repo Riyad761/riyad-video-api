@@ -144,7 +144,7 @@ app.get("/api/video/download", async (req, res) => {
 
   // format selection: best mp4 (video+audio muxed) by default, or bestaudio for mp3
   const formatArg = format === "mp3"
-    ? "bestaudio"
+    ? "bestaudio/best"
     : "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best";
 
   try {
