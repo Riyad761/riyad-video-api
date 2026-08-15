@@ -23,12 +23,37 @@
 const express = require("express");
 const yts = require("yt-search");
 const { execFile } = require("child_process");
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+const SEARCH_CACHE_TTL = 5 * 60 * 1000;
+const DOWNLOAD_CACHE_TTL = 90 * 1000;
+const searchCache = new Map();
+const searchInflight = new Map();
+const downloadCache = new Map();
+const downloadInflight = new Map();
+
+function cacheGet(cache, key, ttl) {
+  const entry = cache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.createdAt > ttl) {
+    cache.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function cacheSet(cache, key, value) {
+  cache.set(key, { value, createdAt: Date.now() });
+  if (cache.size > 100) cache.delete(cache.keys().next().value);
+  return value;
+}
+
+function youtubeThumbnail(videoId) {
+  return `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
+}
 
 // ─────────────────────────────────────────────
 //  Optional YouTube cookies (env var YOUTUBE_COOKIES, Netscape cookies.txt
@@ -55,20 +80,33 @@ if (process.env.YOUTUBE_COOKIES && process.env.YOUTUBE_COOKIES.trim()) {
 //  GET /api/video/search?songName=...
 // ─────────────────────────────────────────────
 app.get("/api/video/search", async (req, res) => {
-  const songName = req.query.songName;
+  const songName = String(req.query.songName || "").trim();
   if (!songName) {
     return res.status(400).json({ error: "songName query param is required" });
   }
 
   try {
-    const result = await yts(songName);
-    const videos = (result.videos || []).slice(0, 10).map(v => ({
-      id: v.videoId,
-      title: v.title,
-      duration: v.timestamp,
-      thumbnail: v.thumbnail,
-      url: v.url
-    }));
+    const key = songName.toLowerCase();
+    const cached = cacheGet(searchCache, key, SEARCH_CACHE_TTL);
+    if (cached) return res.json(cached);
+
+    let request = searchInflight.get(key);
+    if (!request) {
+      request = yts(songName).then((result) => {
+        const videos = (result.videos || []).slice(0, 10).map(v => ({
+          id: v.videoId,
+          title: v.title,
+          duration: v.timestamp,
+          // Small thumbnails make the numbered collage much faster.
+          thumbnail: youtubeThumbnail(v.videoId),
+          url: v.url
+        }));
+        return cacheSet(searchCache, key, videos);
+      }).finally(() => searchInflight.delete(key));
+      searchInflight.set(key, request);
+    }
+
+    const videos = await request;
 
     if (videos.length === 0) {
       return res.status(404).json([]);
@@ -87,26 +125,36 @@ app.get("/api/video/search", async (req, res) => {
 //  get lyric-video versions of the song instead of the regular MV/audio.
 // ─────────────────────────────────────────────
 app.get("/api/video/lyrics", async (req, res) => {
-  const songName = req.query.songName;
+  const songName = String(req.query.songName || "").trim();
   if (!songName) {
     return res.status(400).json({ error: "songName query param is required" });
   }
 
   try {
-    const result = await yts(`${songName} lyrics`);
-    const all = result.videos || [];
+    const key = `${songName.toLowerCase()}::lyrics`;
+    const cached = cacheGet(searchCache, key, SEARCH_CACHE_TTL);
+    if (cached) return res.json(cached);
 
-    // Prefer results whose title actually says "lyric(s)" — a plain
-    // "<song> lyrics" search still returns some non-lyric-video results
-    // mixed in (official MV, audio-only upload, etc).
-    const lyricsOnly = all.filter(v => /lyrics?/i.test(v.title));
-    const videos = (lyricsOnly.length ? lyricsOnly : all).slice(0, 10).map(v => ({
-      id: v.videoId,
-      title: v.title,
-      duration: v.timestamp,
-      thumbnail: v.thumbnail,
-      url: v.url
-    }));
+    let request = searchInflight.get(key);
+    if (!request) {
+      request = yts(`${songName} lyrics`).then((result) => {
+        const all = result.videos || [];
+
+        // Prefer results whose title actually says "lyric(s)".
+        const lyricsOnly = all.filter(v => /lyrics?/i.test(v.title));
+        const videos = (lyricsOnly.length ? lyricsOnly : all).slice(0, 10).map(v => ({
+          id: v.videoId,
+          title: v.title,
+          duration: v.timestamp,
+          thumbnail: youtubeThumbnail(v.videoId),
+          url: v.url
+        }));
+        return cacheSet(searchCache, key, videos);
+      }).finally(() => searchInflight.delete(key));
+      searchInflight.set(key, request);
+    }
+
+    const videos = await request;
 
     if (videos.length === 0) {
       return res.status(404).json([]);
@@ -131,6 +179,7 @@ function runYtDlp(url, formatArg) {
       "-f", formatArg,
       "-g", "--no-playlist",
       "--print", "%(title)s",
+      "--no-warnings",
       "--js-runtimes", "deno",
       // FIX: the "android" player client does NOT support cookies at all —
       // yt-dlp prints "Skipping client android since it does not support
@@ -169,7 +218,7 @@ async function resolveDownload(url, formatArg) {
 }
 
 app.get("/api/video/download", async (req, res) => {
-  const link = req.query.link;
+  const link = String(req.query.link || "").trim();
   const format = (req.query.format || "mp4").toLowerCase();
 
   if (!link) {
@@ -180,28 +229,37 @@ app.get("/api/video/download", async (req, res) => {
     ? link
     : `https://www.youtube.com/watch?v=${link}`;
 
-  // format selection: best mp4 (video+audio muxed) by default, or bestaudio for mp3
+  // Return one playable stream. Asking for bestvideo+bestaudio here can
+  // produce two URLs, while the bot can only download one URL.
   const formatArg = format === "mp3"
     ? "bestaudio/best"
-    : "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best";
+    : "best[ext=mp4]/best";
+  const cacheKey = `${url}::${format}`;
 
   try {
-    const stdout = await resolveDownload(url, formatArg);
+    const cached = cacheGet(downloadCache, cacheKey, DOWNLOAD_CACHE_TTL);
+    if (cached) return res.json(cached);
 
-    // yt-dlp with -g and --print prints: title first, then one URL per
-    // selected stream (2 lines for separate video+audio, 1 for muxed/audio-only)
-    const lines = stdout.trim().split(os.EOL).filter(Boolean);
-    const title = lines[0] || "YouTube Video";
-    const links = lines.slice(1);
+    let request = downloadInflight.get(cacheKey);
+    if (!request) {
+      request = resolveDownload(url, formatArg).then((stdout) => {
+        const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
+        const title = lines[0] || "YouTube Video";
+        const links = lines.slice(1);
 
-    if (links.length === 0) {
-      return res.status(500).json({ error: "No downloadable stream found" });
+        if (links.length === 0) {
+          throw new Error("No downloadable stream found");
+        }
+
+        return cacheSet(downloadCache, cacheKey, {
+          downloadLink: links[0],
+          title
+        });
+      }).finally(() => downloadInflight.delete(cacheKey));
+      downloadInflight.set(cacheKey, request);
     }
 
-    return res.json({
-      downloadLink: links[0],
-      title
-    });
+    return res.json(await request);
   } catch (err) {
     console.error("[download] yt-dlp error:", err.message);
     return res.status(500).json({ error: "yt-dlp failed", detail: err.message });
