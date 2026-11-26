@@ -18,4 +18,4 @@ RUN npm install --omit=dev
 COPY server.js ./
 
 EXPOSE 3000
-CMD ["npm", "start"]
+CMD ["sh", "-c", "yt-dlp -U || true; npm start"]
