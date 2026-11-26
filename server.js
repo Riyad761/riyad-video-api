@@ -1,22 +1,9 @@
 /**
- * ╔══════════════════════════════════════════════════════════════╗
- * ║        RIYAD VIDEO API — YouTube Search & Download            ║
- * ╚══════════════════════════════════════════════════════════════╝
- *
- * Drop-in replacement for the third-party "mahmud" API that vidio.js
- * currently calls. Same endpoint shapes, so vidio.js needs NO code
- * changes — just point its apiUrl at this server instead.
- *
- * Endpoints:
- *   GET /api/video/search?songName=<query>
- *     -> [ { id, title, duration, thumbnail }, ... ]
- *
- *   GET /api/video/download?link=<videoID>&format=mp4
- *     -> { downloadLink, title }
- *
- * Uses:
- *  - yt-search       -> find a YouTube video by name (no API key needed)
- *  - yt-dlp (binary)  -> resolve a direct, playable download URL
+ * RIYAD VIDEO API - YouTube Search & Download
+ * GET /api/video/search?songName=
+ * GET /api/video/lyrics?songName=
+ * GET /api/video/download?link=<videoID or URL>&format=mp4|mp3
+ * GET /api/video/formats?link=<videoID or URL>   (debug: lists available formats)
  */
 "use strict";
 
@@ -55,13 +42,7 @@ function youtubeThumbnail(videoId) {
   return `https://i.ytimg.com/vi/${videoId}/mqdefault.jpg`;
 }
 
-// ─────────────────────────────────────────────
-//  Optional YouTube cookies (env var YOUTUBE_COOKIES, Netscape cookies.txt
-//  format). YouTube heavily rate-limits/blocks cloud-provider IPs (429
-//  errors) regardless of client emulation — the practical fix is sending
-//  requests as a logged-in browser session via cookies. Written to disk
-//  once at startup so yt-dlp can reference it with --cookies.
-// ─────────────────────────────────────────────
+// Optional YouTube cookies (env var YOUTUBE_COOKIES, Netscape cookies.txt).
 const COOKIES_PATH = path.join(__dirname, "cookies.txt");
 let hasCookies = false;
 if (process.env.YOUTUBE_COOKIES && process.env.YOUTUBE_COOKIES.trim()) {
@@ -73,12 +54,20 @@ if (process.env.YOUTUBE_COOKIES && process.env.YOUTUBE_COOKIES.trim()) {
     console.error("⚠️ Failed to write cookies file:", e.message);
   }
 } else {
-  console.warn("⚠️ No YOUTUBE_COOKIES env var set — requests may hit 429 rate limits on cloud IPs.");
+  console.warn("⚠️ No YOUTUBE_COOKIES env var set — requests may be blocked on cloud IPs.");
 }
 
-// ─────────────────────────────────────────────
-//  GET /api/video/search?songName=...
-// ─────────────────────────────────────────────
+// ── search ──────────────────────────────────
+function mapVideos(list) {
+  return list.slice(0, 10).map((v) => ({
+    id: v.videoId,
+    title: v.title,
+    duration: v.timestamp,
+    thumbnail: youtubeThumbnail(v.videoId),
+    url: v.url
+  }));
+}
+
 app.get("/api/video/search", async (req, res) => {
   const songName = String(req.query.songName || "").trim();
   if (!songName) {
@@ -92,25 +81,14 @@ app.get("/api/video/search", async (req, res) => {
 
     let request = searchInflight.get(key);
     if (!request) {
-      request = yts(songName).then((result) => {
-        const videos = (result.videos || []).slice(0, 10).map(v => ({
-          id: v.videoId,
-          title: v.title,
-          duration: v.timestamp,
-          // Small thumbnails make the numbered collage much faster.
-          thumbnail: youtubeThumbnail(v.videoId),
-          url: v.url
-        }));
-        return cacheSet(searchCache, key, videos);
-      }).finally(() => searchInflight.delete(key));
+      request = yts(songName)
+        .then((result) => cacheSet(searchCache, key, mapVideos(result.videos || [])))
+        .finally(() => searchInflight.delete(key));
       searchInflight.set(key, request);
     }
 
     const videos = await request;
-
-    if (videos.length === 0) {
-      return res.status(404).json([]);
-    }
+    if (videos.length === 0) return res.status(404).json([]);
     return res.json(videos);
   } catch (err) {
     console.error("[search] error:", err.message);
@@ -118,12 +96,6 @@ app.get("/api/video/search", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────
-//  GET /api/video/lyrics?songName=...
-//  Same shape as /api/video/search, but searches "<songName> lyrics" and
-//  prioritizes results whose title actually contains "lyric(s)" — so you
-//  get lyric-video versions of the song instead of the regular MV/audio.
-// ─────────────────────────────────────────────
 app.get("/api/video/lyrics", async (req, res) => {
   const songName = String(req.query.songName || "").trim();
   if (!songName) {
@@ -137,28 +109,18 @@ app.get("/api/video/lyrics", async (req, res) => {
 
     let request = searchInflight.get(key);
     if (!request) {
-      request = yts(`${songName} lyrics`).then((result) => {
-        const all = result.videos || [];
-
-        // Prefer results whose title actually says "lyric(s)".
-        const lyricsOnly = all.filter(v => /lyrics?/i.test(v.title));
-        const videos = (lyricsOnly.length ? lyricsOnly : all).slice(0, 10).map(v => ({
-          id: v.videoId,
-          title: v.title,
-          duration: v.timestamp,
-          thumbnail: youtubeThumbnail(v.videoId),
-          url: v.url
-        }));
-        return cacheSet(searchCache, key, videos);
-      }).finally(() => searchInflight.delete(key));
+      request = yts(`${songName} lyrics`)
+        .then((result) => {
+          const all = result.videos || [];
+          const lyricsOnly = all.filter((v) => /lyrics?/i.test(v.title));
+          return cacheSet(searchCache, key, mapVideos(lyricsOnly.length ? lyricsOnly : all));
+        })
+        .finally(() => searchInflight.delete(key));
       searchInflight.set(key, request);
     }
 
     const videos = await request;
-
-    if (videos.length === 0) {
-      return res.status(404).json([]);
-    }
+    if (videos.length === 0) return res.status(404).json([]);
     return res.json(videos);
   } catch (err) {
     console.error("[lyrics] error:", err.message);
@@ -166,14 +128,9 @@ app.get("/api/video/lyrics", async (req, res) => {
   }
 });
 
-// ─────────────────────────────────────────────
-//  GET /api/video/download?link=<videoID or URL>&format=mp4
-//
-//  Resolves a direct, temporary googlevideo.com URL via yt-dlp
-//  (much more reliable against YouTube's anti-bot changes than
-//  pure-JS libraries like ytdl-core, which break often).
-// ─────────────────────────────────────────────
-function runYtDlp(url, formatArg) {
+// ── download via yt-dlp ─────────────────────
+// clientArgs: extra yt-dlp args that choose the YouTube player client.
+function runYtDlp(url, formatArg, clientArgs) {
   return new Promise((resolve, reject) => {
     const args = [
       "-f", formatArg,
@@ -181,12 +138,7 @@ function runYtDlp(url, formatArg) {
       "--print", "%(title)s",
       "--no-warnings",
       "--js-runtimes", "deno",
-      // FIX: the "android" player client does NOT support cookies at all —
-      // yt-dlp prints "Skipping client android since it does not support
-      // cookies" and silently falls back to a client that then gets
-      // bot-detected ("This video is unavailable"). "web" supports cookies
-      // properly, which is the whole point of having YOUTUBE_COOKIES set.
-      "--extractor-args", "youtube:player_client=web"
+      ...(clientArgs || [])
     ];
     if (hasCookies) args.push("--cookies", COOKIES_PATH);
     args.push(url);
@@ -203,18 +155,44 @@ function runYtDlp(url, formatArg) {
   });
 }
 
+// Try several player clients one by one. Forcing a single client (web)
+// can leave no usable formats, so start with yt-dlp's own defaults.
+const CLIENT_ATTEMPTS = [
+  [],
+  ["--extractor-args", "youtube:player_client=web_safari"],
+  ["--extractor-args", "youtube:player_client=mweb"]
+];
+
 async function resolveDownload(url, formatArg) {
-  try {
-    return await runYtDlp(url, formatArg);
-  } catch (e) {
-    // YouTube's shared cloud-IP rate limiting (429) is often transient —
-    // one short retry clears it a meaningful fraction of the time.
-    if (/429|Too Many Requests/i.test(e.message)) {
-      await new Promise(r => setTimeout(r, 3000));
-      return await runYtDlp(url, formatArg);
+  let firstErr = null;
+  let lastErr = null;
+
+  for (const clientArgs of CLIENT_ATTEMPTS) {
+    try {
+      return await runYtDlp(url, formatArg, clientArgs);
+    } catch (e) {
+      // transient rate limit: one short retry with the same client
+      if (/429|Too Many Requests/i.test(e.message)) {
+        await new Promise((r) => setTimeout(r, 3000));
+        try {
+          return await runYtDlp(url, formatArg, clientArgs);
+        } catch (e2) {
+          e = e2;
+        }
+      }
+      if (!firstErr) firstErr = e;
+      lastErr = e;
+      // bad/expired cookies: other clients will not help
+      if (/Sign in to confirm/i.test(e.message)) break;
     }
-    throw e;
   }
+  throw firstErr || lastErr;
+}
+
+function toUrl(link) {
+  return /^https?:\/\//i.test(link)
+    ? link
+    : `https://www.youtube.com/watch?v=${link}`;
 }
 
 app.get("/api/video/download", async (req, res) => {
@@ -225,15 +203,12 @@ app.get("/api/video/download", async (req, res) => {
     return res.status(400).json({ error: "link query param is required" });
   }
 
-  const url = /^https?:\/\//i.test(link)
-    ? link
-    : `https://www.youtube.com/watch?v=${link}`;
+  const url = toUrl(link);
 
-  // Return one playable stream. Asking for bestvideo+bestaudio here can
-  // produce two URLs, while the bot can only download one URL.
+  // One playable stream only (the bot downloads a single URL).
   const formatArg = format === "mp3"
     ? "bestaudio/best"
-    : "best[ext=mp4]/best";
+    : "best[ext=mp4]/18/best";
   const cacheKey = `${url}::${format}`;
 
   try {
@@ -242,20 +217,15 @@ app.get("/api/video/download", async (req, res) => {
 
     let request = downloadInflight.get(cacheKey);
     if (!request) {
-      request = resolveDownload(url, formatArg).then((stdout) => {
-        const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
-        const title = lines[0] || "YouTube Video";
-        const links = lines.slice(1);
-
-        if (links.length === 0) {
-          throw new Error("No downloadable stream found");
-        }
-
-        return cacheSet(downloadCache, cacheKey, {
-          downloadLink: links[0],
-          title
-        });
-      }).finally(() => downloadInflight.delete(cacheKey));
+      request = resolveDownload(url, formatArg)
+        .then((stdout) => {
+          const lines = stdout.trim().split(/\r?\n/).filter(Boolean);
+          const title = lines[0] || "YouTube Video";
+          const links = lines.slice(1);
+          if (links.length === 0) throw new Error("No downloadable stream found");
+          return cacheSet(downloadCache, cacheKey, { downloadLink: links[0], title });
+        })
+        .finally(() => downloadInflight.delete(cacheKey));
       downloadInflight.set(cacheKey, request);
     }
 
@@ -266,11 +236,33 @@ app.get("/api/video/download", async (req, res) => {
   }
 });
 
+// Debug: shows which formats YouTube offers for a video.
+app.get("/api/video/formats", (req, res) => {
+  const link = String(req.query.link || "").trim();
+  if (!link) return res.status(400).json({ error: "link query param is required" });
+
+  const args = ["-F", "--no-playlist", "--no-warnings", "--js-runtimes", "deno"];
+  if (hasCookies) args.push("--cookies", COOKIES_PATH);
+  args.push(toUrl(link));
+
+  execFile("yt-dlp", args, { timeout: 30000, maxBuffer: 1024 * 1024 * 5 }, (err, stdout, stderr) => {
+    const out = String(stdout || "");
+    res.type("text/plain").send(
+      err ? `ERROR:\n${String(stderr || err.message).slice(0, 1500)}` : out.slice(-3500)
+    );
+  });
+});
+
 app.get("/", (req, res) => {
   res.json({
     status: "ok",
     cookiesLoaded: hasCookies,
-    endpoints: ["/api/video/search?songName=", "/api/video/lyrics?songName=", "/api/video/download?link=&format="]
+    endpoints: [
+      "/api/video/search?songName=",
+      "/api/video/lyrics?songName=",
+      "/api/video/download?link=&format=",
+      "/api/video/formats?link="
+    ]
   });
 });
 
