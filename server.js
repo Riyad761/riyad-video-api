@@ -206,10 +206,11 @@ app.get("/api/video/download", async (req, res) => {
   const url = toUrl(link);
 
   // One playable stream only (the bot downloads a single URL).
+    // Only plain https files (no HLS/DASH manifests): "ext=mp4" alone also
+  // matches HLS playlists, which are not real video files.
   const formatArg = format === "mp3"
-    ? "bestaudio/best"
-    : "best[ext=mp4]/18/best";
-  const cacheKey = `${url}::${format}`;
+    ? "bestaudio[ext=m4a][protocol=https]/bestaudio[protocol=https]/bestaudio"
+    : "18/best[ext=mp4][protocol=https][height<=480]/best[ext=mp4][protocol=https]/best[protocol=https]";
 
   try {
     const cached = cacheGet(downloadCache, cacheKey, DOWNLOAD_CACHE_TTL);
@@ -223,6 +224,9 @@ app.get("/api/video/download", async (req, res) => {
           const title = lines[0] || "YouTube Video";
           const links = lines.slice(1);
           if (links.length === 0) throw new Error("No downloadable stream found");
+          if (/\.m3u8|manifest\.googlevideo\.com/i.test(links[0])) {
+            throw new Error("Only streaming (HLS) formats available for this video");
+          }
           return cacheSet(downloadCache, cacheKey, { downloadLink: links[0], title });
         })
         .finally(() => downloadInflight.delete(cacheKey));
