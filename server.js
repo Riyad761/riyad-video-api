@@ -206,11 +206,12 @@ app.get("/api/video/download", async (req, res) => {
   const url = toUrl(link);
 
   // One playable stream only (the bot downloads a single URL).
-    // Only plain https files (no HLS/DASH manifests): "ext=mp4" alone also
+  // Only plain https files (no HLS/DASH manifests): "ext=mp4" alone also
   // matches HLS playlists, which are not real video files.
   const formatArg = format === "mp3"
     ? "bestaudio[ext=m4a][protocol=https]/bestaudio[protocol=https]/bestaudio"
     : "18/best[ext=mp4][protocol=https][height<=480]/best[ext=mp4][protocol=https]/best[protocol=https]";
+  const cacheKey = `${url}::${format}`;
 
   try {
     const cached = cacheGet(downloadCache, cacheKey, DOWNLOAD_CACHE_TTL);
