@@ -16,7 +16,9 @@ const path = require("path");
 const app = express();
 const PORT = process.env.PORT || 3000;
 const SEARCH_CACHE_TTL = 5 * 60 * 1000;
-const DOWNLOAD_CACHE_TTL = 90 * 1000;
+// Resolved stream links stay valid for hours, so a longer cache makes
+// repeat requests for the same video instant.
+const DOWNLOAD_CACHE_TTL = 20 * 60 * 1000;
 const searchCache = new Map();
 const searchInflight = new Map();
 const downloadCache = new Map();
@@ -130,7 +132,8 @@ app.get("/api/video/lyrics", async (req, res) => {
 
 // ── download via yt-dlp ─────────────────────
 // clientArgs: extra yt-dlp args that choose the YouTube player client.
-function runYtDlp(url, formatArg, clientArgs) {
+// useCookies: pass the cookies file or not.
+function runYtDlp(url, formatArg, clientArgs, useCookies) {
   return new Promise((resolve, reject) => {
     const args = [
       "-f", formatArg,
@@ -140,7 +143,7 @@ function runYtDlp(url, formatArg, clientArgs) {
       "--js-runtimes", "deno",
       ...(clientArgs || [])
     ];
-    if (hasCookies) args.push("--cookies", COOKIES_PATH);
+    if (useCookies && hasCookies) args.push("--cookies", COOKIES_PATH);
     args.push(url);
 
     execFile(
@@ -163,28 +166,44 @@ const CLIENT_ATTEMPTS = [
   ["--extractor-args", "youtube:player_client=mweb"]
 ];
 
+// Errors that mean "the cookies are the problem" -> other clients with the
+// same cookies will not help, so move on to the no-cookies mode.
+const COOKIE_PROBLEM_RE = /Sign in to confirm|page needs to be reloaded/i;
+
 async function resolveDownload(url, formatArg) {
+  // 1st pass: with cookies (if any). 2nd pass: without cookies, because
+  // stale/rotated cookies cause "The page needs to be reloaded" even for
+  // videos that would work fine anonymously.
+  const modes = hasCookies ? [true, false] : [false];
   let firstErr = null;
   let lastErr = null;
 
-  for (const clientArgs of CLIENT_ATTEMPTS) {
-    try {
-      return await runYtDlp(url, formatArg, clientArgs);
-    } catch (e) {
-      // transient rate limit: one short retry with the same client
-      if (/429|Too Many Requests/i.test(e.message)) {
-        await new Promise((r) => setTimeout(r, 3000));
-        try {
-          return await runYtDlp(url, formatArg, clientArgs);
-        } catch (e2) {
-          e = e2;
+  for (const useCookies of modes) {
+    for (const clientArgs of CLIENT_ATTEMPTS) {
+      try {
+        return await runYtDlp(url, formatArg, clientArgs, useCookies);
+      } catch (e) {
+        // transient rate limit: one short retry with the same client
+        if (/429|Too Many Requests/i.test(e.message)) {
+          await new Promise((r) => setTimeout(r, 3000));
+          try {
+            return await runYtDlp(url, formatArg, clientArgs, useCookies);
+          } catch (e2) {
+            e = e2;
+          }
+        }
+        if (!firstErr) firstErr = e;
+        lastErr = e;
+        if (COOKIE_PROBLEM_RE.test(e.message)) {
+          console.warn(`[download] cookie problem (useCookies=${useCookies}):`, e.message.slice(0, 200));
+          break;
         }
       }
-      if (!firstErr) firstErr = e;
-      lastErr = e;
-      // bad/expired cookies: other clients will not help
-      if (/Sign in to confirm/i.test(e.message)) break;
     }
+  }
+
+  if (firstErr && lastErr && firstErr !== lastErr) {
+    throw new Error(`${firstErr.message}\n--- last attempt ---\n${lastErr.message}`);
   }
   throw firstErr || lastErr;
 }
@@ -208,6 +227,7 @@ app.get("/api/video/download", async (req, res) => {
   // One playable stream only (the bot downloads a single URL).
   // Only plain https files (no HLS/DASH manifests): "ext=mp4" alone also
   // matches HLS playlists, which are not real video files.
+  // Format 18 = 360p mp4 with audio in ONE file -> small + fast, no ffmpeg.
   const formatArg = format === "mp3"
     ? "bestaudio[ext=m4a][protocol=https]/bestaudio[protocol=https]/bestaudio"
     : "18/best[ext=mp4][protocol=https][height<=480]/best[ext=mp4][protocol=https]/best[protocol=https]";
@@ -242,12 +262,13 @@ app.get("/api/video/download", async (req, res) => {
 });
 
 // Debug: shows which formats YouTube offers for a video.
+// Add &nocookies=1 to test without the cookies file.
 app.get("/api/video/formats", (req, res) => {
   const link = String(req.query.link || "").trim();
   if (!link) return res.status(400).json({ error: "link query param is required" });
 
   const args = ["-F", "--no-playlist", "--no-warnings", "--js-runtimes", "deno"];
-  if (hasCookies) args.push("--cookies", COOKIES_PATH);
+  if (hasCookies && req.query.nocookies !== "1") args.push("--cookies", COOKIES_PATH);
   args.push(toUrl(link));
 
   execFile("yt-dlp", args, { timeout: 30000, maxBuffer: 1024 * 1024 * 5 }, (err, stdout, stderr) => {
